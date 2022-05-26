@@ -1,0 +1,125 @@
+This installs Adobe Acrobat Reader 32bit using a hardcoded link.
+It then updates it to the latest patch and disables automatic updates.
+Enhanced-Security-Mode and the EULA is also disabled.
+
+It's a multi-step process
+1. Kill all the running Adobe processes that could stop the installation.
+2. Uninstall Adobe if it's already installed
+3. Install Adobe using a hardcoded link
+4. Scrape and install the latest Adobe patch file from [[https://www.adobe.com/devnet-docs/acrobatetk/tools/ReleaseNotesDC/][the Adobe Release Notes page]].
+5. Disable automatic updates
+
+The Adobe installer fails if Adobe is already running.
+This is usually the case if a Practice Management software is open (i.e Dentrix Document Center).
+The script get's all the processes that start with "Acro", kills them, then waits for the process to finish terminating.
+#+begin_src powershell
+  $ids=(Get-Process -Name acro*).id
+  foreach ($id in $ids){
+      Stop-Process -Force $id 2>&1 | Out-Null
+      Wait-Process -Id $id 2>&1 | Out-Null
+  }
+#+end_src
+
+The next step is to uninstall Adobe.
+There are a couple registry keys in Windows that store the installation information for all programs.
+This would include the install location, program name, uninstall string, etc.
+
+Some applications use a custom EXE file to uninstall themselves (i.e CryptoPrevent).
+Others, such as Adobe, use msiexec.
+This is what makes the silent uninstall a breeze.
+
+We parse out the registry to get the Adobe uninstall string.
+Using the "-match" operator in powershell, I'm able to grep out the program id.
+Msiexec uses the program id to uninstall Adobe silently.
+#+begin_src powershell 
+  # Storing the contents of the registry keys that hold software uninstall information
+  $progs=Get-ChildItem -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall, HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall | Get-ItemProperty
+
+  # Uninstalling it silently
+  try{
+      Write-Host "Uninstalling Adobe if it's installed."
+      # This is where I pull the program id from the uninstall string.
+      # The $matches variable is automatically created by the -match operator
+      (($progs | Where {$_.displayname -match "Adobe Acrobat.*DC"}).uninstallstring) -match "{.*.}" | Out-Null
+      Start-Process "msiexec.exe" -ArgumentList "/X $($matches[0]) /qn" -Wait
+  } catch {
+      "Couldn't find Adobe Acrobat Reader."
+  }
+#+end_src
+
+Next we install Adobe using a hardcoded link.
+This will act as the base version that we'll later update.
+Hiding the progress bar ($ProgressPreference='SilentlyContinue') increases downloads speeds 20 fold.
+
+#+begin_src powershell 
+  $ProgressPreference='SilentlyContinue'
+  Write-Host "Downloading Adobe."
+  Invoke-WebRequest -Uri 'https://ardownload2.adobe.com/pub/adobe/reader/win/AcrobatDC/2200120085/AcroRdrDC2200120085_en_US.exe' -OutFile "$env:temp\adobereader.exe" -UseBasicParsing
+#+end_src
+
+When the file is first downloaded, I check the hash of it a single time.
+If the file hash is different, the Adobe installer gets re-downloaded.
+It only does this check once.
+I'm assuming that the file hash will always be the same.
+I won't stop the installation process if it fails a second time.
+
+#+begin_src powershell 
+  $hashItShouldBe="3656695886E2E7A62A6C321DA1A22593"
+  $hash=Get-FileHash $env:temp\adobereader.exe -Algorithm MD5
+  if ($hash.hash -ne $hashItShouldBe){
+      Write-Host "MD5Sum didn't match. Redownloading Adobe."
+      Write-Host "The installer will run regardless if the MD5Sum doesn't match a second time."
+      Invoke-WebRequest -Uri 'https://ardownload2.adobe.com/pub/adobe/reader/win/AcrobatDC/2200120085/AcroRdrDC2200120085_en_US.exe' -OutFile "$env:temp\adobereader.exe" -UseBasicParsing
+  }
+#+end_src
+
+Once Adobe is installed, the next step is to download and apply the latest patch.
+Adobe Acrobat Reader DC is a rolling release, meaning that we won't have to deal with new versions coming out.
+I scrape the Adobe Release page to download a patch file that updates our out-dated Adobe to most recent version.
+It essentially grabs all the links, finds the page that contains the patches for the current month, scrapes that page, and finally downloads the patch.
+
+#+begin_src powershell 
+  Write-Host "Locating the latest Adobe patch file for this month."
+  $base="https://www.adobe.com/devnet-docs/acrobatetk/tools/ReleaseNotesDC/"
+  $link=(Invoke-WebRequest -Uri "https://www.adobe.com/devnet-docs/acrobatetk/tools/ReleaseNotesDC/index.html" -UseBasicParsing).links.href | Select-String "continuous/dccontinuous" | Select -First 1
+  $link = $base+$link
+
+  Write-Host "Downloading the latest Adobe patch file."
+  # After finding the patch notes for the month, let's parse out the URL for the latest patch file
+  $patchlink=(Invoke-WebRequest -Uri "$link" -UseBasicParsing).links.href | Select-String "pub/adobe/reader/win/AcrobatDC/" | Select -First 1
+  # Get the filename from the url and download it
+  $filename=([uri]"$patchlink").Segments[-1]
+  # Download the patch.msp
+  Invoke-WebRequest -Uri "$patchlink" -OutFile "$env:temp/$filename" -UseBasicParsing
+  Write-Host "Installing the patch."
+  Start-Process "$env:temp/$filename" -ArgumentList "/qn" -Wait
+  Remove-Item "$env:temp/$filename"
+#+end_src
+
+Using the same process, it installs the Extended Language Font Pack for Adobe.
+This is for the scanned documents that contain random Asian characters.
+I'm not sure why some documents contain them, but this will make sure you can still open those documents.
+
+Now that Adobe is up-to-date, the next step is to disable automatic updates and enhanced security mode.
+Adobe Updates are controlled by an update service, scheduled task, and a few registry keys.
+In an ideal world, the service and scheduled task should be enough to disable them.
+I add the registry keys since we've been having issues with the automatic updates.
+
+Enhanced Security Mode also has a registry key in HKLM
+
+#+begin_src powershell
+  Disable-ScheduledTask -TaskName "Adobe Acrobat Update Task"
+  Stop-Service -Name "Adobe Acrobat Update Service"
+  Set-Service -Name "AdobeARMservice" -StartupType Disabled
+  # Disables and locks down the update button
+  New-Item "HKLM:\Software\WOW6432Node\Policies\Adobe\Acrobat Reader\DC" -ErrorAction SilentlyContinue
+  New-Item "HKLM:\Software\WOW6432Node\Policies\Adobe\Acrobat Reader\DC\FeatureLockDown" -ErrorAction SilentlyContinue
+  New-ItemProperty "HKLM:\Software\WOW6432Node\Policies\Adobe\Acrobat Reader\DC\FeatureLockDown" -Name "Mode" -Value 0 -PropertyType DWORD -Force
+  New-ItemProperty "HKLM:\Software\WOW6432Node\Policies\Adobe\Acrobat Reader\DC\FeatureLockDown" -Name "bUpdater" -Value 0 -PropertyType DWORD -Force
+  New-ItemProperty "HKLM:\Software\WOW6432Node\Policies\Adobe\Acrobat Reader\DC\FeatureLockDown" -Name "bProtectedModeValue" -Value 0 -PropertyType DWORD -Force
+  # This *should* disable enhanced security mode
+  New-ItemProperty "HKLM:\Software\WOW6432Node\Policies\Adobe\Acrobat Reader\DC\FeatureLockDown" -Name "bEnhancedSecurityStandalone" -Value 0 -PropertyType DWORD -Force
+  New-ItemProperty "HKLM:\Software\WOW6432Node\Policies\Adobe\Acrobat Reader\DC\FeatureLockDown" -Name "bEnhancedSecurityInBrowser" -Value 0 -PropertyType DWORD -Force
+#+end_src
+
+After that, Adobe is installed!
